@@ -27,24 +27,22 @@ def _find_env():
 _path, _name = _find_env()
 
 if _path:
+    # локальный запуск — ключи из файла .env
     load_dotenv(_path, override=True)
     if _name != ".env":
         print(f"\n⚠️  Нашёл настройки в файле '{_name}' (правильное имя — '.env').")
         print("    Работать буду, но лучше переименуй.\n")
+elif os.getenv("BOT_TOKEN"):
+    # запуск на сервере (Bothost, VPS, Docker) — ключи уже в переменных окружения
+    print("ℹ️  Файла .env нет — беру ключи из переменных окружения. Это норма для сервера.\n")
 else:
     print("=" * 58)
-    print("❌ НЕ НАШЁЛ ФАЙЛ НАСТРОЕК")
+    print("❌ НЕ НАШЁЛ НИ ФАЙЛА .env, НИ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ")
     print("=" * 58)
-    print(f"\nИскал в папке:\n   {HERE}\n")
-    try:
-        print("Что лежит в этой папке:")
-        for f in sorted(os.listdir(HERE)):
-            if not f.startswith("__"):
-                print(f"   {f}")
-    except Exception:
-        pass
-    print("\nЧТО ДЕЛАТЬ: положи файл .env в папку выше,")
-    print("либо запусти:  python setup.py")
+    print(f"\nИскал файл .env в папке:\n   {HERE}\n")
+    print("На сервере (Bothost и т.п.): впиши ключи в раздел")
+    print("«Переменные окружения» — как минимум BOT_TOKEN и TP_TOKEN.")
+    print("\nНа своём компьютере: положи рядом файл .env с ключами.")
     print("=" * 58)
     sys.exit(1)
 
