@@ -1,0 +1,37 @@
+[
+  {"origin": "MOW", "origin_name": "Москва", "dest": "AER", "dest_name": "Сочи",
+   "type": "round", "nights": [5, 10], "threshold": 9000},
+
+  {"origin": "MOW", "origin_name": "Москва", "dest": "LED", "dest_name": "Санкт-Петербург",
+   "type": "round", "nights": [2, 5], "threshold": 5000},
+
+  {"origin": "MOW", "origin_name": "Москва", "dest": "KZN", "dest_name": "Казань",
+   "type": "round", "nights": [2, 5], "threshold": 6000},
+
+  {"origin": "MOW", "origin_name": "Москва", "dest": "SVX", "dest_name": "Екатеринбург",
+   "type": "round", "nights": [3, 7], "threshold": 8000},
+
+  {"origin": "MOW", "origin_name": "Москва", "dest": "IST", "dest_name": "Стамбул",
+   "type": "round", "nights": [5, 10], "threshold": 22000},
+
+  {"origin": "MOW", "origin_name": "Москва", "dest": "DXB", "dest_name": "Дубай",
+   "type": "round", "nights": [5, 10], "threshold": 30000},
+
+  {"origin": "MOW", "origin_name": "Москва", "dest": "CXR", "dest_name": "Нячанг",
+   "type": "round", "nights": [10, 21], "threshold": 55000},
+
+  {"origin": "MOW", "origin_name": "Москва", "dest": "BKK", "dest_name": "Бангкок",
+   "type": "round", "nights": [10, 21], "threshold": 55000},
+
+  {"origin": "MOW", "origin_name": "Москва", "dest": "HKT", "dest_name": "Пхукет",
+   "type": "round", "nights": [10, 21], "threshold": 60000},
+
+  {"origin": "LED", "origin_name": "Санкт-Петербург", "dest": "AER", "dest_name": "Сочи",
+   "type": "round", "nights": [5, 10], "threshold": 11000},
+
+  {"origin": "LED", "origin_name": "Санкт-Петербург", "dest": "IST", "dest_name": "Стамбул",
+   "type": "round", "nights": [5, 10], "threshold": 24000},
+
+  {"origin": "SVX", "origin_name": "Екатеринбург", "dest": "AER", "dest_name": "Сочи",
+   "type": "round", "nights": [5, 10], "threshold": 13000}
+]
