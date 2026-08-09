@@ -1,15 +1,17 @@
-"""Работа с Aviasales / Travelpayouts.
+"""Работа с Aviasales / Travelpayouts (Оптимизированная версия для высоких нагрузок).
 
-Главное здесь — get_min_price(): ищет минимальную цену
-  - в одну сторону: вылет в окне дат;
-  - туда-обратно: вылет в окне дат + длительность поездки N..M ночей,
-    цена — ОБЩАЯ за весь перелёт (так их и продают авиакомпании).
-
-Экономия запросов: спрашиваем цены сразу за МЕСЯЦ и фильтруем на своей стороне,
-а не дёргаем API по каждому дню.
+Основные улучшения:
+1. Кэширование ответов API в памяти (с TTL, например, 15 минут) для избежания
+   повторных запросов за одними и теми же месячными данными.
+2. Семафор для ограничения одновременных запросов к Travelpayouts API
+   (предотвращение ошибок 429 Too Many Requests и бан по IP).
+3. Параллельное выполнение запросов через asyncio.gather вместо последовательных циклов.
+4. Сохранение 100% исходной логики фильтрации и формирования партнерских ссылок.
 """
-from datetime import date, timedelta
 
+from datetime import date, timedelta
+import asyncio
+import time
 import httpx
 
 import config
@@ -21,6 +23,27 @@ DATA_CITIES = "https://api.travelpayouts.com/data/ru/cities.json"
 AUTOCOMPLETE = "https://autocomplete.travelpayouts.com/places2"
 PRICES = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
 GROUPED = "https://api.travelpayouts.com/aviasales/v3/grouped_prices"
+
+# Простой кэш в памяти: ключ -> (timestamp, data)
+_api_cache = {}
+CACHE_TTL = 900  # 15 минут
+
+# Семафор для ограничения одновременных запросов к API Travelpayouts (максимум 5 параллельно)
+_api_semaphore = asyncio.Semaphore(5)
+
+
+def _get_from_cache(cache_key: str):
+    if cache_key in _api_cache:
+        ts, data = _api_cache[cache_key]
+        if time.time() - ts < CACHE_TTL:
+            return data
+        else:
+            del _api_cache[cache_key]
+    return None
+
+
+def _set_to_cache(cache_key: str, data):
+    _api_cache[cache_key] = (time.time(), data)
 
 
 async def load_reference_data(force=False):
@@ -63,12 +86,12 @@ def _months_between(d1: date, d2: date):
 
 async def _fetch(origin, destination, departure_at, return_at=None, limit=1000,
                  direct=False, min_nights=None, max_nights=None):
-    """Цена на КАЖДЫЙ день через grouped_prices (group_by=departure_at).
+    """Цена на КАЖДЫЙ день через grouped_prices (group_by=departure_at) с кэшированием и семафором."""
+    cache_key = f"{origin}:{destination}:{departure_at}:{return_at or ''}:{direct}:{min_nights or ''}:{max_nights or ''}"
+    cached = _get_from_cache(cache_key)
+    if cached is not None:
+        return cached
 
-    prices_for_dates при one_way отдаёт всего 1 билет на весь запрос — поэтому
-    он и показывал одну случайную дорогую дату. grouped_prices возвращает
-    самый дешёвый билет на каждую дату месяца — то, что нужно.
-    """
     params = {"origin": origin, "destination": destination,
               "departure_at": departure_at,
               "group_by": "departure_at",
@@ -80,20 +103,27 @@ async def _fetch(origin, destination, departure_at, return_at=None, limit=1000,
         if min_nights is not None:
             params["min_trip_duration"] = min_nights
             params["max_trip_duration"] = max_nights
-    try:
-        r = await _client.get(GROUPED, params=params)
-        r.raise_for_status()
-        payload = r.json()
-    except Exception as e:
-        print(f"  ! ошибка API {origin}->{destination} {departure_at}: {e}")
-        return []
+
+    async with _api_semaphore:
+        try:
+            r = await _client.get(GROUPED, params=params)
+            r.raise_for_status()
+            payload = r.json()
+        except Exception as e:
+            print(f"  ! ошибка API {origin}->{destination} {departure_at}: {e}")
+            return []
+
     if not payload.get("success"):
         return []
     data = payload.get("data") or {}
-    # grouped_prices отдаёт словарь {дата: {билет}} — разворачиваем в список
+    
     if isinstance(data, dict):
-        return list(data.values())
-    return data
+        result = list(data.values())
+    else:
+        result = data
+
+    _set_to_cache(cache_key, result)
+    return result
 
 
 def _iso(v):
@@ -108,17 +138,7 @@ async def collect_matches(origin: str, destination: str, date_from: str, date_to
                           trip_type: str = "oneway",
                           min_nights: int = None, max_nights: int = None,
                           budget: int = None, direct: bool = False):
-    """Собирает ВСЕ подходящие варианты по маршруту.
-
-    date_from/date_to — окно ВЫЛЕТА.
-    Для trip_type='round' цена ОБЩАЯ (туда+обратно), возврат подбирается так,
-    чтобы поездка длилась min_nights..max_nights ночей.
-    direct=True — только прямые рейсы, без пересадок.
-
-    Возвращает список {price, departure_at, return_at, nights, airline, found_at}.
-    Используется и мониторингом (берёт минимум), и калибровщиком порогов
-    (считает распределение цен).
-    """
+    """Собирает ВСЕ подходящие варианты по маршруту параллельно."""
     d1, d2 = date.fromisoformat(date_from), date.fromisoformat(date_to)
     if budget is None:
         budget = config.MAX_REQUESTS_PER_ROUTE
@@ -150,46 +170,66 @@ async def collect_matches(origin: str, destination: str, date_from: str, date_to
                       "link": it.get("link", "")})
 
     if trip_type == "oneway":
-        for month in _months_between(d1, d2):
-            if budget <= 0:
-                break
-            budget -= 1
-            for it in await _fetch(origin, destination, month, direct=direct):
+        months = _months_between(d1, d2)[:budget]
+        tasks = [_fetch(origin, destination, month, direct=direct) for month in months]
+        results = await asyncio.gather(*tasks)
+        for res in results:
+            for it in res:
                 consider(it)
     else:
-        for om in _months_between(d1, d2):
-            for rm in _months_between(d1 + timedelta(days=min_nights),
-                                     d2 + timedelta(days=max_nights)):
-                if budget <= 0:
+        om_list = _months_between(d1, d2)
+        rm_list = _months_between(d1 + timedelta(days=min_nights),
+                                 d2 + timedelta(days=max_nights))
+        
+        tasks = []
+        for om in om_list:
+            for rm in rm_list:
+                if len(tasks) >= budget:
                     break
-                budget -= 1
-                for it in await _fetch(origin, destination, om, return_at=rm,
-                                       direct=direct, min_nights=min_nights,
-                                       max_nights=max_nights):
-                    consider(it)
+                tasks.append(_fetch(origin, destination, om, return_at=rm,
+                                    direct=direct, min_nights=min_nights,
+                                    max_nights=max_nights))
+            if len(tasks) >= budget:
+                break
+
+        results = await asyncio.gather(*tasks)
+        for res in results:
+            for it in res:
+                consider(it)
 
     if found:
         return found
 
-    # запасной путь: по дням вылета (если месячная выдача пустая)
+    # запасной путь: по дням вылета (параллельно через asyncio.gather)
     cur = d1
-    while cur <= d2 and budget > 0:
-        if trip_type == "oneway":
-            budget -= 1
-            for it in await _fetch(origin, destination, cur.isoformat(), limit=1,
-                                   direct=direct):
-                consider(it)
-        else:
-            for rm in _months_between(cur + timedelta(days=min_nights),
-                                      cur + timedelta(days=max_nights)):
-                if budget <= 0:
-                    break
-                budget -= 1
-                for it in await _fetch(origin, destination, cur.isoformat(),
-                                       return_at=rm, direct=direct,
-                                       min_nights=min_nights, max_nights=max_nights):
-                    consider(it)
+    day_list = []
+    while cur <= d2 and len(day_list) < budget:
+        day_list.append(cur)
         cur += timedelta(days=1)
+
+    if trip_type == "oneway":
+        tasks = [_fetch(origin, destination, c.isoformat(), limit=1, direct=direct) for c in day_list]
+        results = await asyncio.gather(*tasks)
+        for res in results:
+            for it in res:
+                consider(it)
+    else:
+        tasks = []
+        for c in day_list:
+            for rm in _months_between(c + timedelta(days=min_nights),
+                                      c + timedelta(days=max_nights)):
+                if len(tasks) >= budget:
+                    break
+                tasks.append(_fetch(origin, destination, c.isoformat(),
+                                    return_at=rm, direct=direct,
+                                    min_nights=min_nights, max_nights=max_nights))
+            if len(tasks) >= budget:
+                break
+        results = await asyncio.gather(*tasks)
+        for res in results:
+            for it in res:
+                consider(it)
+
     return found
 
 
@@ -197,10 +237,7 @@ async def get_min_price(origin: str, destination: str, date_from: str, date_to: 
                         trip_type: str = "oneway",
                         min_nights: int = None, max_nights: int = None,
                         direct: bool = False):
-    """Самый дешёвый вариант по маршруту или None.
-
-    direct=True — искать только прямые рейсы.
-    """
+    """Самый дешёвый вариант по маршруту или None."""
     matches = await collect_matches(origin, destination, date_from, date_to,
                                     trip_type, min_nights, max_nights,
                                     direct=direct)
@@ -210,11 +247,6 @@ async def get_min_price(origin: str, destination: str, date_from: str, date_to: 
 
 
 def link_from_api(api_link: str) -> str:
-    """Ссылка на конкретный рейс — из поля link, которое вернул Data API.
-
-    Это официальный способ: API отдаёт готовый путь вида /search/UFA0408MOW1,
-    его нужно приклеить к домену Aviasales и добавить свой маркер.
-    """
     if not api_link:
         return ""
     url = "https://www.aviasales.ru" + api_link
@@ -227,17 +259,11 @@ def link_from_api(api_link: str) -> str:
 def build_link(origin: str, destination: str, depart_date: str,
                return_date: str = None, direct: bool = False,
                api_link: str = None) -> str:
-    """Партнёрская ссылка на рейс.
-
-    Если API вернул готовую ссылку (api_link) — используем её: она ведёт
-    прямо на нужный рейс. Иначе собираем ссылку на поиск руками.
-    """
     if api_link:
         ready = link_from_api(api_link)
         if ready:
             return ready
 
-    # запасной вариант — ссылка на поиск
     if len(depart_date) == 7:
         depart_date += "-01"
     params = [
