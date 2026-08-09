@@ -1,4 +1,4 @@
-"""База данных SQLite: справочник городов, подписки, история постов в канал."""
+"""База данных SQLite: оптимизированная версия для высоких нагрузок."""
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -12,8 +12,15 @@ _conn: Optional[sqlite3.Connection] = None
 def get_conn() -> sqlite3.Connection:
     global _conn
     if _conn is None:
+        # check_same_thread=False важен для асинхронности
         _conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
         _conn.row_factory = sqlite3.Row
+        
+        # ВКЛЮЧАЕМ РЕЖИМ WAL (Write-Ahead Logging)
+        # Это позволяет читать из базы, пока в неё идет запись.
+        # Критически важно для 1000+ подписок.
+        _conn.execute("PRAGMA journal_mode=WAL;")
+        _conn.execute("PRAGMA synchronous=NORMAL;")
     return _conn
 
 
@@ -50,7 +57,6 @@ def init_db():
         );
         """
     )
-    # мягкая миграция — если база осталась от старой версии
     cols = {r["name"] for r in c.execute("PRAGMA table_info(subscriptions)")}
     for name, ddl in (("trip_type", "TEXT DEFAULT 'oneway'"),
                       ("min_nights", "INTEGER"),
@@ -60,8 +66,6 @@ def init_db():
             c.execute(f"ALTER TABLE subscriptions ADD COLUMN {name} {ddl}")
     c.commit()
 
-
-# ---------- справочник ----------
 
 def cities_is_empty() -> bool:
     return get_conn().execute("SELECT COUNT(*) AS n FROM cities").fetchone()["n"] == 0
@@ -80,8 +84,6 @@ def save_cities(items):
                   "VALUES (?, ?, ?, ?)", rows)
     c.commit()
 
-
-# ---------- подписки ----------
 
 def add_subscription(user_id, origin_code, origin_name, dests, date_from, date_to,
                      trip_type, min_nights, max_nights, max_price, direct=0) -> int:
@@ -140,8 +142,6 @@ def count_users() -> int:
     return get_conn().execute(
         "SELECT COUNT(DISTINCT user_id) AS n FROM subscriptions").fetchone()["n"]
 
-
-# ---------- история постов в канал ----------
 
 def get_posted_deal(route_key: str):
     return get_conn().execute(
