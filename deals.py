@@ -1,4 +1,4 @@
-"""Автопостинг находок в публичный канал (Оптимизированная версия)."""
+"""Автопостинг находок в публичный канал (ФИНАЛЬНАЯ ПОЛНАЯ ВЕРСИЯ)."""
 import asyncio
 import json
 import os
@@ -17,25 +17,32 @@ MONTHS_GEN = ["янв", "фев", "мар", "апр", "мая", "июн",
 def money(n) -> str:
     return f"{n:,}".replace(",", " ")
 
+
 def short_date(iso: str) -> str:
     d = date.fromisoformat(iso)
     return f"{d.day} {MONTHS_GEN[d.month - 1]}"
+
 
 def nights_word(n: int) -> str:
     if 11 <= n % 100 <= 14:
         return "ночей"
     return {1: "ночь", 2: "ночи", 3: "ночи", 4: "ночи"}.get(n % 10, "ночей")
 
+
 def load_deals():
     if not os.path.exists(config.DEALS_FILE):
+        print(f"⚠️  Файл {config.DEALS_FILE} не найден — автопостинг пропущен.")
         return []
     try:
         with open(config.DEALS_FILE, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        print(f"⚠️  Не смог прочитать {config.DEALS_FILE}: {e}")
         return []
 
 def should_post(route_key: str, price: int) -> bool:
+    """Не спамим: повторяем пост, только если цена заметно упала
+    или прошло достаточно дней."""
     prev = db.get_posted_deal(route_key)
     if prev is None:
         return True
@@ -48,7 +55,8 @@ def should_post(route_key: str, price: int) -> bool:
     age = datetime.now(timezone.utc) - posted
     return age > timedelta(days=config.DEALS_REPOST_DAYS) and price <= prev["price"]
 
-async def process_deal(bot: Bot, bot_username: str, d, date_from, date_to):
+
+async def process_deal(bot: Bot, bot_username: str, d, date_from, date_to, force=False):
     """Обработка одного маршрута для канала."""
     trip_type = d.get("type", "round")
     nights = d.get("nights", [5, 10])
@@ -61,19 +69,19 @@ async def process_deal(bot: Bot, bot_username: str, d, date_from, date_to):
             return False
 
         route_key = f"{d['origin']}-{d['dest']}-{trip_type}"
-        if not should_post(route_key, best["price"]):
+        if not force and not should_post(route_key, best["price"]):
             return False
 
-        # Формирование сообщения и отправка (код из вашего оригинала)
-        # ... (здесь ваш код отправки в канал) ...
-        
+        await post_deal(bot, bot_username, d, best, trip_type)
         db.save_posted_deal(route_key, best["price"])
         return True
     except Exception as e:
-        print(f" Ошибка в сделке {d['origin']}->{d['dest']}: {e}")
+        print(f"  ! ошибка в сделке {d['origin']}->{d['dest']}: {e}")
         return False
 
+
 async def check_and_post(bot: Bot, bot_username: str, force=False) -> int:
+    """Один проход по deals.json. Возвращает число опубликованных постов."""
     if not config.CHANNEL_ID:
         return 0
     deals = load_deals()
@@ -84,16 +92,45 @@ async def check_and_post(bot: Bot, bot_username: str, force=False) -> int:
     date_from = today.isoformat()
     date_to = (today + timedelta(days=config.DEALS_LOOKAHEAD_DAYS)).isoformat()
     
-    print(f"[deals] Проверяем {len(deals)} популярных маршрутов...")
+    print(f"[deals] проверяю {len(deals)} популярных маршрутов...")
     
-    # Проверяем пачками по 5 штук
     posted_count = 0
+    # Проверяем пачками по 5 штук
     batch_size = 5
     for i in range(0, len(deals), batch_size):
         batch = deals[i:i+batch_size]
-        tasks = [process_deal(bot, bot_username, d, date_from, date_to) for d in batch]
+        tasks = [process_deal(bot, bot_username, d, date_from, date_to, force) for d in batch]
         results = await asyncio.gather(*tasks)
         posted_count += sum(1 for r in results if r)
-        await asyncio.sleep(1) # Пауза между пачками
+        await asyncio.sleep(2) # Пауза между пачками и постами
 
+    print(f"[deals] опубликовано постов: {posted_count}")
     return posted_count
+
+
+async def post_deal(bot: Bot, bot_username: str, d, best, trip_type):
+    link = aviasales.build_link(d["origin"], d["dest"], best["departure_at"],
+                                best.get("return_at"),
+                                api_link=best.get("link"))
+    if trip_type == "round":
+        kind = "туда-обратно"
+        when = (f"📅 {short_date(best['departure_at'])} → "
+                f"{short_date(best['return_at'])} "
+                f"({best['nights']} {nights_word(best['nights'])})")
+    else:
+        kind = "в одну сторону"
+        when = f"📅 вылет {short_date(best['departure_at'])}"
+
+    text = (f"🔥 <b>{d['origin_name']} → {d['dest_name']}</b>\n\n"
+            f"💰 <b>{money(best['price'])} ₽</b> {kind}\n"
+            f"{when}\n\n"
+            f"⚠️ Цена из кэша — проверь актуальную по кнопке, "
+            f"дешёвые тарифы разбирают быстро.")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Смотреть билет", url=link)],
+        [InlineKeyboardButton(text="🔔 Следить за своим маршрутом",
+                              url=f"https://t.me/{bot_username}?start=deal")],
+    ])
+    await bot.send_message(config.CHANNEL_ID, text, reply_markup=kb,
+                           disable_web_page_preview=True)
